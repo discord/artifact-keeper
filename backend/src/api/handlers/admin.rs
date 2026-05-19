@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -34,6 +35,10 @@ pub fn router() -> Router<SharedState> {
         .route("/reindex", post(trigger_reindex))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
+        .route(
+            "/repositories/:key/cache/invalidate",
+            post(invalidate_proxy_cache),
+        )
 }
 
 /// List available storage backends.
@@ -938,6 +943,68 @@ pub async fn rescan_for_inventory(
     }))
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct InvalidateProxyCacheQuery {
+    /// Optional artifact path. When set, only the entry at that path is
+    /// invalidated. When omitted, every cached entry for the repository
+    /// is dropped.
+    pub path: Option<String>,
+}
+
+/// Invalidate proxy cache entries for a repository.
+///
+/// Without `?path=...`, drops every object under `proxy-cache/<key>/`.
+/// With `?path=...`, deletes only the content + metadata sidecar pair
+/// for that single artifact path. Requires admin privileges.
+#[utoipa::path(
+    post,
+    path = "/repositories/{key}/cache/invalidate",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        InvalidateProxyCacheQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Cache invalidated"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 503, description = "Proxy service not configured"),
+    )
+)]
+pub async fn invalidate_proxy_cache(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(key): Path<String>,
+    Query(query): Query<InvalidateProxyCacheQuery>,
+) -> Result<StatusCode> {
+    auth.require_admin()?;
+
+    let proxy = state.proxy_service.as_ref().ok_or_else(|| {
+        AppError::Internal("Proxy service not configured on this instance".to_string())
+    })?;
+
+    let deleted = match query.path.as_deref() {
+        Some(path) => {
+            // Per-path: reuse the existing helper, which validates the
+            // cache key (path traversal + length cap, #1052 / #1044).
+            proxy.invalidate_cache_by_key(&key, path).await?;
+            1
+        }
+        None => proxy.invalidate_repo_cache(&key).await?,
+    };
+
+    tracing::info!(
+        repo_key = %key,
+        path = ?query.path,
+        deleted,
+        actor = %auth.username,
+        "admin proxy cache invalidate"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -955,6 +1022,7 @@ pub async fn rescan_for_inventory(
         trigger_reindex,
         rescan_for_inventory,
         list_storage_backends,
+        invalidate_proxy_cache,
     ),
     components(schemas(
         ListBackupsQuery,

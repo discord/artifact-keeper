@@ -970,6 +970,41 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Drop every cached entry for a repository.
+    ///
+    /// Lists everything under `proxy-cache/<repo_key>/` and deletes each
+    /// object (both `__content__` blobs and `__cache_meta__.json` sidecars).
+    /// Per-object failures are logged but do not abort the sweep — the goal
+    /// is best-effort eviction. Returns the number of objects deleted.
+    ///
+    /// Used by `set_cache_ttl` so that a TTL change reclaims the bytes
+    /// still held by entries written under the previous TTL, and by the
+    /// admin invalidate endpoint as the bulk hammer for the per-repo case.
+    pub async fn invalidate_repo_cache(&self, repo_key: &str) -> Result<usize> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = self.storage.list(Some(&prefix)).await?;
+        let mut deleted = 0usize;
+        for key in &keys {
+            match self.storage.delete(key).await {
+                Ok(()) => deleted += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        cache_key = %key,
+                        error = %e,
+                        "proxy cache invalidate: per-object delete failed; continuing"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            repo_key = %repo_key,
+            deleted,
+            listed = keys.len(),
+            "proxy cache invalidate_repo_cache complete"
+        );
+        Ok(deleted)
+    }
+
     /// Fetch an artifact from upstream and report whether the content
     /// differs from what was previously cached.
     ///
@@ -4014,6 +4049,121 @@ SHA256:
                 deletes
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // invalidate_repo_cache: bulk eviction by prefix
+    //
+    // Backs the admin invalidate endpoint. Must list under
+    // `proxy-cache/<repo_key>/`, delete every returned key, and not touch
+    // entries that belong to other repos.
+    // -----------------------------------------------------------------------
+
+    /// Mock that returns a fixed key universe filtered by list-prefix, and
+    /// records every delete. Used to exercise invalidate_repo_cache without
+    /// a real backend.
+    struct PrefixListAndDeleteStorage {
+        keys: Vec<String>,
+        deletes: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl PrefixListAndDeleteStorage {
+        fn new(keys: Vec<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                keys: keys.into_iter().map(String::from).collect(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+        async fn deletes_snapshot(&self) -> Vec<String> {
+            self.deletes.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for PrefixListAndDeleteStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(match prefix {
+                Some(p) => self
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with(p))
+                    .cloned()
+                    .collect(),
+                None => self.keys.clone(),
+            })
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_repo_cache_deletes_only_matching_repo() {
+        // Seed two repos' worth of cache objects. invalidate_repo_cache
+        // for "npm-proxy" must delete exactly the four npm-proxy keys
+        // (lodash content+meta, express content+meta) and leave the
+        // other-repo key alone, even though it lives under the same
+        // proxy-cache/ root.
+        let storage = PrefixListAndDeleteStorage::new(vec![
+            "proxy-cache/npm-proxy/lodash/__content__",
+            "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+            "proxy-cache/npm-proxy/express/__content__",
+            "proxy-cache/npm-proxy/express/__cache_meta__.json",
+            "proxy-cache/other-repo/foo/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .invalidate_repo_cache("npm-proxy")
+            .await
+            .expect("invalidate_repo_cache");
+
+        assert_eq!(deleted, 4, "should report exact deletion count");
+        let deletes = storage.deletes_snapshot().await;
+        assert_eq!(deletes.len(), 4);
+        assert!(
+            deletes
+                .iter()
+                .all(|k| k.starts_with("proxy-cache/npm-proxy/")),
+            "must not delete keys belonging to other repos: {:?}",
+            deletes
+        );
+        assert!(
+            !deletes.iter().any(|k| k.contains("other-repo")),
+            "other-repo cache entry leaked into delete set: {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_repo_cache_empty_repo_is_noop() {
+        let storage =
+            PrefixListAndDeleteStorage::new(vec!["proxy-cache/other-repo/foo/__content__"]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .invalidate_repo_cache("npm-proxy")
+            .await
+            .expect("invalidate_repo_cache");
+
+        assert_eq!(deleted, 0);
+        assert!(storage.deletes_snapshot().await.is_empty());
     }
 
     // -----------------------------------------------------------------------
